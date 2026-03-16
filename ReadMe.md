@@ -32,7 +32,7 @@ While iCloud Drive provides seamless cloud storage on Apple platforms, bulk-down
 1. Create and activate a virtual environment:
 ```sh
 python3 -m venv ivenv
-source venv/bin/activate
+source ivenv/bin/activate
 ```
 
 2. Install Python dependencies:
