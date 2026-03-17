@@ -32,7 +32,7 @@ While iCloud Drive provides seamless cloud storage on Apple platforms, bulk-down
 1. Create and activate a virtual environment:
 ```sh
 python3 -m venv ivenv
-source venv/bin/activate
+source ivenv/bin/activate
 ```
 
 2. Install Python dependencies:
@@ -83,7 +83,7 @@ python ifetch/cli.py Documents/Programming ~/LocalDoc/Programming
 ### Download with custom settings
 Download a specific directory or file with custom settings:
 ```sh
-python cli.py Documents/Programming ~/Work/Code \
+python ifetch/cli.py Documents/Programming ~/Work/Code \
   --email=you@apple.com \
   --max-workers=8 \
   --max-retries=5 \
