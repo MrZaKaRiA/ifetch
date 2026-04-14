@@ -263,18 +263,44 @@ class DownloadManager:
 
         raise Exception(f"Failed to download chunk {start}-{end} after {self.max_retries} retries: {last_error}")
 
-    def _open_with_retry(self, item: Any, max_retries: Optional[int] = None) -> Any:
+    def _open_with_retry(
+        self,
+        item: Any,
+        max_retries: Optional[int] = None,
+        remote_path: Optional[str] = None,
+    ) -> Any:
         """Open item with retry logic for transient connection errors."""
         if max_retries is None:
             max_retries = self.max_retries
 
         last_error = None
+        current_item = item
         for attempt in range(max_retries):
             try:
-                return item.open(stream=True)
+                return current_item.open(stream=True)
             except Exception as e:
                 last_error = e
                 error_str = str(e).lower()
+                not_found = (
+                    "404" in error_str or
+                    "not found" in error_str or
+                    "wsobjectnotfound" in error_str or
+                    "objectnotfoundexception" in error_str
+                )
+                if not_found and remote_path and attempt < max_retries - 1:
+                    try:
+                        current_item = self.get_drive_item(remote_path)
+                        self.logger.warning(json.dumps({
+                            "event": "item_refreshed",
+                            "file": getattr(item, 'name', 'unknown'),
+                            "remote_path": remote_path,
+                            "attempt": attempt + 1,
+                        }))
+                        continue
+                    except Exception as refresh_error:
+                        last_error = refresh_error
+                        raise
+
                 # Retry on connection errors and server errors, not on auth or other permanent errors
                 retryable = any(x in error_str for x in [
                     'connection', 'remote', 'timeout', 'reset',
@@ -291,7 +317,7 @@ class DownloadManager:
                             wait_time = min(int(match.group(1)), 60)
                     self.logger.warning(json.dumps({
                         "event": "connection_retry",
-                        "file": getattr(item, 'name', 'unknown'),
+                        "file": getattr(current_item, 'name', 'unknown'),
                         "attempt": attempt + 1,
                         "wait_seconds": wait_time,
                         "error": str(e)
@@ -301,7 +327,12 @@ class DownloadManager:
                 raise  # Non-retryable error
         raise last_error  # All retries exhausted
 
-    def download_drive_item(self, item: Any, local_path: Path) -> bool:
+    def download_drive_item(
+        self,
+        item: Any,
+        local_path: Path,
+        remote_path: Optional[str] = None,
+    ) -> bool:
         """Download file with differential updates support and checkpointing."""
         if not hasattr(item, 'name') or not hasattr(item, 'open'):
             self.logger.warning(json.dumps({
@@ -315,7 +346,7 @@ class DownloadManager:
         total_size = 0
 
         try:
-            with self._open_with_retry(item) as response:
+            with self._open_with_retry(item, remote_path=remote_path) as response:
                 total_size = int(response.headers.get('content-length', 0))
                 temp_path = local_path.with_suffix(local_path.suffix + '.temp')
                 existing_chunks = self.chunker.get_file_chunks(local_path)
@@ -340,15 +371,6 @@ class DownloadManager:
 
                 bytes_to_download = sum(end - start + 1 for start, end in changed_ranges)
 
-                # Backup current file before modifications for rollback/versioning
-                if local_path.exists() and self.version_manager:
-                    try:
-                        old_checksum = self.calculate_checksum(local_path)
-                        rel_path = local_path.relative_to(self.root_path) if self.root_path else local_path.name
-                        self.version_manager.record_version(rel_path, old_checksum, local_path)
-                    except Exception:
-                        pass  # Non-fatal; continue with download
-
                 # Create parent directories if they don't exist
                 local_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -361,6 +383,15 @@ class DownloadManager:
                     with temp_path.open('wb') as f:
                         f.seek(total_size - 1)
                         f.write(b'\0')
+
+                # Backup current file after temp file is prepared so resumed data is preserved.
+                if local_path.exists() and self.version_manager:
+                    try:
+                        old_checksum = self.calculate_checksum(local_path)
+                        rel_path = local_path.relative_to(self.root_path) if self.root_path else local_path.name
+                        self.version_manager.record_version(rel_path, old_checksum, local_path)
+                    except Exception:
+                        pass  # Non-fatal; continue with download
 
                 with temp_path.open('r+b') as out_file:
                     for start, end in changed_ranges:
@@ -450,7 +481,12 @@ class DownloadManager:
 
         # Notify plugins about before/after failures handled above
 
-    def process_item_parallel(self, item: Any, local_path: Path) -> None:
+    def process_item_parallel(
+        self,
+        item: Any,
+        local_path: Path,
+        remote_path: Optional[str] = None,
+    ) -> None:
         """Process files and directories in parallel."""
         try:
             # If file/dir is excluded by patterns, skip
@@ -470,7 +506,7 @@ class DownloadManager:
                     self.plugin_manager.dispatch(
                         "before_download", remote_item=item, local_path=local_path
                     )
-                    if self.download_drive_item(item, local_path):
+                    if self.download_drive_item(item, local_path, remote_path=remote_path):
                         self.logger.info(json.dumps({
                             "event": "download_success",
                             "file": getattr(item, 'name', 'unknown'),
@@ -493,12 +529,15 @@ class DownloadManager:
                     # "dictionary changed size during iteration" when pyicloud lazily
                     # loads items and modifies its internal cache
                     content_names = list(contents.keys()) if hasattr(contents, 'keys') else list(contents)
-                    child_items = [(item[name], local_path / name) for name in content_names]
+                    child_items = []
+                    for name in content_names:
+                        child_remote_path = name if not remote_path else f"{remote_path.rstrip('/')}/{name}"
+                        child_items.append((item[name], local_path / name, child_remote_path))
                     local_path.mkdir(parents=True, exist_ok=True)
                     with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                         futures = [
-                            executor.submit(self.process_item_parallel, child_item, child_path)
-                            for child_item, child_path in child_items
+                            executor.submit(self.process_item_parallel, child_item, child_path, child_remote_path)
+                            for child_item, child_path, child_remote_path in child_items
                         ]
                         for future in as_completed(futures):
                             # Retrieve result or exception
@@ -640,7 +679,8 @@ class DownloadManager:
             "chunk_size": self.chunker.chunk_size
         }))
 
-        self.process_item_parallel(item, local_path_obj)
+        remote_path = icloud_path.strip("/") or None
+        self.process_item_parallel(item, local_path_obj, remote_path=remote_path)
 
         report = self.generate_summary_report()
         self.logger.info(json.dumps({"event": "download_completed", "summary": report}))
@@ -663,6 +703,11 @@ class DownloadManager:
         for pat in self.exclude_patterns:
             if fnmatch(path_str, pat):
                 return False
+
+        # Files can be filtered aggressively; directories must stay traversable
+        # or include globs like "*.pdf" will prune matching descendants.
+        if is_dir:
+            return True
 
         # Include logic: if include list empty -> include all; else must match one
         if not self.include_patterns:

@@ -8,6 +8,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from ifetch.downloader import DownloadManager  # noqa: E402
 from ifetch import cli  # noqa: E402
+from ifetch.versioning import VersionManager  # noqa: E402
 
 
 class DummyItem:
@@ -74,6 +75,95 @@ def test_download_drive_item_merges_contiguous_ranges(tmp_path, monkeypatch):
 
     assert dm.download_drive_item(item, local_path) is True
     assert calls == [(0, 9)]
+
+
+def test_download_drive_item_recovers_from_initial_open_404(tmp_path, monkeypatch):
+    dm = DownloadManager(email="user@example.com", max_retries=2)
+    monkeypatch.setattr(dm.chunker, "get_file_chunks", lambda p: {})
+    monkeypatch.setattr(dm.chunker, "find_changed_chunks", lambda resp, chunks, local_path=None: [(0, 9)])
+    monkeypatch.setattr(dm, "download_chunk", lambda url, start, end, item=None: b"0123456789")
+    monkeypatch.setattr(dm, "calculate_checksum", lambda p: "dummy")
+
+    class _ResponseCtx:
+        def __init__(self):
+            self.headers = {"content-length": "10"}
+            self.url = "https://dummy.download/url"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _StaleItem:
+        name = "test.txt"
+        type = "file"
+        size = 10
+
+        def __init__(self):
+            self.calls = 0
+
+        def open(self, stream=True):
+            self.calls += 1
+            raise Exception(
+                'Not Found (404): {"error_code":"WSObjectNotFound","reason":"ObjectNotFoundException: Could not find document"}'
+            )
+
+    class _FreshItem:
+        name = "test.txt"
+        type = "file"
+        size = 10
+
+        def open(self, stream=True):
+            return _ResponseCtx()
+
+    stale = _StaleItem()
+    fresh = _FreshItem()
+    resolved = []
+
+    def _refresh(remote_path):
+        resolved.append(remote_path)
+        return fresh
+
+    monkeypatch.setattr(dm, "get_drive_item", _refresh)
+
+    local_path = tmp_path / "test.txt"
+
+    ok = dm.download_drive_item(stale, local_path, remote_path="Documents/test.txt")
+
+    assert ok is True
+    assert resolved == ["Documents/test.txt"]
+    assert local_path.exists() and local_path.read_bytes() == b"0123456789"
+
+
+def test_download_drive_item_preserves_resumed_prefix_with_versioning(tmp_path, monkeypatch):
+    dm = DownloadManager(email="user@example.com", max_retries=1)
+    dm.root_path = tmp_path
+    dm.version_manager = VersionManager(tmp_path)
+
+    local_path = tmp_path / "test.txt"
+    local_path.write_bytes(b"abcde")
+
+    monkeypatch.setattr(dm.chunker, "get_file_chunks", lambda p: {"existing": (0, 4)})
+    monkeypatch.setattr(dm.chunker, "find_changed_chunks", lambda resp, chunks, local_path=None: [(5, 9)])
+    monkeypatch.setattr(dm, "download_chunk", lambda url, start, end, item=None: b"fghij")
+    monkeypatch.setattr(dm, "calculate_checksum", lambda p: "dummy")
+
+    item = DummyItem("test.txt", 10, b"abcdefghij")
+
+    ok = dm.download_drive_item(item, local_path, remote_path="Documents/test.txt")
+
+    assert ok is True
+    assert local_path.read_bytes() == b"abcdefghij"
+    assert any(tmp_path.joinpath(".versions").rglob("test.txt.v1_*"))
+
+
+def test_should_process_keeps_directories_traversable_for_include_globs():
+    dm = DownloadManager(email="user@example.com", include_patterns=["*.pdf"])
+
+    assert dm._should_process(Path("Documents"), is_dir=True) is True
+    assert dm._should_process(Path("Documents/file.pdf"), is_dir=False) is True
+    assert dm._should_process(Path("Documents/file.txt"), is_dir=False) is False
 
 
 def test_list_contents_and_cli(monkeypatch, tmp_path):
