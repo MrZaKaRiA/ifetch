@@ -135,25 +135,69 @@ class DownloadManager:
 
         # Try owned drive first
         try:
-            item: Any = owned_root
-            for part in parts:
-                if item is None:
-                    raise KeyError
-                item = item[part]
+            item = self._walk_path(owned_root, parts)
             return item
         except (KeyError, AttributeError):
             # Fall back to shared items only when failing at the *first* segment
             if shared_root is None:
-                raise Exception(f"Path not found: {path}")
+                available = self._list_child_names(owned_root)
+                hint = f" Available top-level items: {', '.join(available)}" if available else ""
+                raise Exception(f"Path not found: {path}.{hint}")
 
         # Restart traversal from shared root
         try:
-            item = shared_root
-            for part in parts:
-                item = item[part]
+            item = self._walk_path(shared_root, parts)
             return item
         except (KeyError, AttributeError):
-            raise Exception(f"Path not found: {path}")
+            owned_available = self._list_child_names(owned_root)
+            shared_available = self._list_child_names(shared_root)
+            available = owned_available or shared_available
+            hint = f" Available top-level items: {', '.join(available)}" if available else ""
+            raise Exception(f"Path not found: {path}.{hint}")
+
+    def _walk_path(self, root: Any, parts: List[str]) -> Any:
+        """Walk a slash-separated path from a given root."""
+        item = root
+        for part in parts:
+            if item is None:
+                raise KeyError(part)
+            item = self._resolve_child(item, part)
+        return item
+
+    def _resolve_child(self, item: Any, name: str) -> Any:
+        """Resolve a child by exact or case-insensitive name."""
+        try:
+            return item[name]
+        except (KeyError, TypeError, AttributeError):
+            child_names = self._list_child_names(item)
+            if not child_names:
+                raise KeyError(name)
+
+            normalized = name.casefold()
+            for child_name in child_names:
+                if child_name.casefold() == normalized:
+                    return item[child_name]
+
+            raise KeyError(name)
+
+    @staticmethod
+    def _list_child_names(item: Any) -> List[str]:
+        """Return child names for dict-like or pyicloud directory nodes."""
+        try:
+            contents = item.dir()
+        except Exception:
+            contents = None
+
+        if isinstance(contents, dict):
+            return list(contents.keys())
+        if isinstance(contents, list):
+            return list(contents)
+        if hasattr(item, "keys"):
+            try:
+                return list(item.keys())
+            except Exception:
+                return []
+        return []
 
     def calculate_checksum(self, file_path: Path) -> str:
         """Calculate SHA-256 checksum of a file."""
