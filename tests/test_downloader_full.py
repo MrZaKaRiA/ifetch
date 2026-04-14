@@ -37,32 +37,13 @@ class DummyItem:
         return _Ctx(self)
 
 
-@pytest.fixture(autouse=True)
-def _patch_tqdm(monkeypatch):
-    """Replace tqdm with a noop to keep tests quiet."""
-    import builtins
-
-    class _NoTqdm(list):
-        def __init__(self, *args, **kwargs):
-            super().__init__()
-        def __enter__(self):
-            return self
-        def __exit__(self, exc_type, exc, tb):
-            return False
-        def update(self, n):
-            pass
-
-    monkeypatch.setattr("ifetch.downloader.tqdm", lambda *a, **kw: _NoTqdm())
-    yield
-
-
 def test_download_drive_item_success(tmp_path, monkeypatch):
     dm = DownloadManager(email="user@example.com", max_retries=1)
 
     # Patch helpers to simplify logic
     monkeypatch.setattr(dm.chunker, "get_file_chunks", lambda p: {})  # pretend no local chunks
-    monkeypatch.setattr(dm.chunker, "find_changed_chunks", lambda resp, chunks: [(0, 9)])
-    monkeypatch.setattr(dm, "download_chunk", lambda url, start, end: b"0123456789")
+    monkeypatch.setattr(dm.chunker, "find_changed_chunks", lambda resp, chunks, local_path=None: [(0, 4), (5, 9)])
+    monkeypatch.setattr(dm, "download_chunk", lambda url, start, end, item=None: b"0123456789")
     monkeypatch.setattr(dm, "calculate_checksum", lambda p: "dummy")
 
     item = DummyItem("test.txt", 10, b"0123456789")
@@ -72,6 +53,27 @@ def test_download_drive_item_success(tmp_path, monkeypatch):
     assert ok is True
     # File should now exist and be 10 bytes long
     assert local_path.exists() and local_path.stat().st_size == 10
+
+
+def test_download_drive_item_merges_contiguous_ranges(tmp_path, monkeypatch):
+    dm = DownloadManager(email="user@example.com", max_retries=1)
+    monkeypatch.setattr(dm.chunker, "get_file_chunks", lambda p: {})
+    monkeypatch.setattr(dm.chunker, "find_changed_chunks", lambda resp, chunks, local_path=None: [(0, 4), (5, 9)])
+    monkeypatch.setattr(dm, "calculate_checksum", lambda p: "dummy")
+
+    calls = []
+
+    def _download_chunk(url, start, end, item=None):
+        calls.append((start, end))
+        return b"0123456789"
+
+    monkeypatch.setattr(dm, "download_chunk", _download_chunk)
+
+    item = DummyItem("test.txt", 10, b"0123456789")
+    local_path = tmp_path / "test.txt"
+
+    assert dm.download_drive_item(item, local_path) is True
+    assert calls == [(0, 9)]
 
 
 def test_list_contents_and_cli(monkeypatch, tmp_path):

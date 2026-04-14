@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional, List, Set, Dict, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+from requests.adapters import HTTPAdapter
 from pyicloud import PyiCloudService
 from pyicloud.exceptions import (
     PyiCloudFailedLoginException,
@@ -47,6 +48,13 @@ class DownloadManager:
         self._active_downloads: Set[str] = set()
         self._download_lock = threading.Lock()
         self.chunker = FileChunker(chunk_size)
+        self.http = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=max(1, max_workers),
+            pool_maxsize=max(1, max_workers * 2),
+        )
+        self.http.mount("http://", adapter)
+        self.http.mount("https://", adapter)
 
         self.include_patterns = include_patterns or []
         self.exclude_patterns = exclude_patterns or []
@@ -152,9 +160,27 @@ class DownloadManager:
         import hashlib
         sha256 = hashlib.sha256()
         with file_path.open('rb') as f:
-            for chunk in iter(lambda: f.read(8192), b''):
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
                 sha256.update(chunk)
         return sha256.hexdigest()
+
+    @staticmethod
+    def _merge_ranges(ranges: List[tuple[int, int]]) -> List[tuple[int, int]]:
+        """Collapse contiguous or overlapping byte ranges into fewer requests."""
+        if not ranges:
+            return []
+
+        ordered = sorted(ranges)
+        merged: List[tuple[int, int]] = [ordered[0]]
+
+        for start, end in ordered[1:]:
+            prev_start, prev_end = merged[-1]
+            if start <= prev_end + 1:
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+
+        return merged
 
     def download_chunk(self, url: str, start: int, end: int, item: Any = None) -> bytes:
         """Download a specific byte range with retries and backoff."""
@@ -164,7 +190,7 @@ class DownloadManager:
 
         while retries < self.max_retries:
             try:
-                resp = requests.get(url, headers=headers, stream=True, timeout=30)
+                resp = self.http.get(url, headers=headers, stream=True, timeout=30)
                 resp.raise_for_status()  # Raise error for non-200/206 status codes
                 if resp.status_code in (200, 206):
                     return resp.content
@@ -250,6 +276,7 @@ class DownloadManager:
                 temp_path = local_path.with_suffix(local_path.suffix + '.temp')
                 existing_chunks = self.chunker.get_file_chunks(local_path)
                 changed_ranges = self.chunker.find_changed_chunks(response, existing_chunks, local_path)
+                changed_ranges = self._merge_ranges(changed_ranges)
 
                 if tracker.current_position > 0:
                     resumed_ranges = []
