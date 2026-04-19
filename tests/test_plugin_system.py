@@ -80,7 +80,7 @@ def test_plugin_hooks(tmp_path, monkeypatch):
     dm = DownloadManager(email="user@example.com")
 
     # Monkeypatch time-intensive function: still dispatch success hook so plugin receives it
-    def _fake_download(item, local_path):
+    def _fake_download(item, local_path, remote_path=None):
         dm.plugin_manager.dispatch(
             "after_download", remote_item=item, local_path=local_path, success=True
         )

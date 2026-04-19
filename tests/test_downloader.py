@@ -37,7 +37,15 @@ def test_download_chunk_success(monkeypatch):
     def _fake_get(url, headers, stream, timeout):
         return _FakeResp(b"abc", status_code=206)
 
-    monkeypatch.setattr("ifetch.downloader.requests.get", _fake_get)
+    monkeypatch.setattr(dm.http, "get", _fake_get)
 
     data = dm.download_chunk("http://example.com/file", 0, 2)
-    assert data == b"abc" 
+    assert data == b"abc"
+
+
+def test_merge_ranges_coalesces_adjacent_segments():
+    dm = DownloadManager(email="user@example.com")
+
+    merged = dm._merge_ranges([(5, 9), (0, 4), (12, 14), (10, 11)])
+
+    assert merged == [(0, 14)]

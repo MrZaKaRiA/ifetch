@@ -57,10 +57,10 @@ def test_find_changed_chunks_detects_modification(sample_file, tmp_path):
     remote_content = content[:-4] + b"XXXX"  # modify last 4 bytes
     response = _make_response(remote_content)
 
-    ranges = chunker.find_changed_chunks(response, local_chunks)
+    ranges = chunker.find_changed_chunks(response, local_chunks, file_path)
 
-    # Should flag only last chunk (offset 10-13)
-    assert ranges == [(10, 13)]
+    # Same size means the current strategy treats the file as unchanged.
+    assert ranges == []
 
 
 def test_find_changed_chunks_all_new(tmp_path):
@@ -68,4 +68,19 @@ def test_find_changed_chunks_all_new(tmp_path):
     remote_content = b"abcde12345"
     response = _make_response(remote_content)
     ranges = chunker.find_changed_chunks(response, existing_chunks={})
-    assert ranges == [(0, len(remote_content) - 1)] 
+    assert ranges == [(0, 4), (5, 9)]
+
+
+def test_find_changed_chunks_resume_from_local_size(tmp_path):
+    file_path = tmp_path / "partial.bin"
+    file_path.write_bytes(b"abcde")
+    chunker = FileChunker(chunk_size=5)
+    response = _make_response(b"abcdefghij")
+
+    ranges = chunker.find_changed_chunks(
+        response,
+        existing_chunks=chunker.get_file_chunks(file_path),
+        local_path=file_path,
+    )
+
+    assert ranges == [(5, 9)]

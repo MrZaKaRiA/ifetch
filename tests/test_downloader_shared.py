@@ -54,4 +54,50 @@ def test_get_drive_item_shared(monkeypatch):
 
     # Path within owned area still works
     owned = dm.get_drive_item("Docs/Personal.txt")
-    assert owned is not None 
+    assert owned is not None
+
+
+class _LazyRoot:
+    """Simulate a root that only exposes children through dir()."""
+    def __init__(self):
+        self.shared = None
+        self._listed = False
+        self._children = {"Documents": _FakeSharedItem()}
+        self._children["Documents"]["Notes.txt"] = object()
+
+    def __getitem__(self, key):
+        if not self._listed:
+            raise KeyError(key)
+        return self._children[key]
+
+    def dir(self):
+        self._listed = True
+        return list(self._children.keys())
+
+
+class _LazyPyiCloudService:
+    requires_2fa = False
+    requires_2sa = False
+
+    def __init__(self, **kwargs):
+        self.drive = _LazyRoot()
+
+
+def test_get_drive_item_resolves_from_directory_listing(monkeypatch):
+    monkeypatch.setattr("ifetch.downloader.PyiCloudService", _LazyPyiCloudService)
+
+    dm = DownloadManager(email="me@example.com")
+    dm.authenticate()
+
+    item = dm.get_drive_item("Documents")
+    assert item is not None
+
+
+def test_get_drive_item_case_insensitive(monkeypatch):
+    monkeypatch.setattr("ifetch.downloader.PyiCloudService", _FakePyiCloudService)
+
+    dm = DownloadManager(email="me@example.com")
+    dm.authenticate()
+
+    item = dm.get_drive_item("docs/personal.txt")
+    assert item is not None
