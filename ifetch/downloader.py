@@ -567,7 +567,7 @@ class DownloadManager:
             error_str = str(e)
             is_shared_file_error = any(x in error_str.lower() for x in [
                 'wsobjectnotfound', 'objectnotfoundexception',
-            ]) or ('404' in error_str and 'not found' in error_str.lower())
+            ])
             log_payload: Dict[str, Any] = {
                 "event": "download_failed",
                 "file": getattr(item, 'name', 'unknown'),
