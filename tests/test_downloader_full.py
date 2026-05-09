@@ -105,9 +105,9 @@ def test_download_drive_item_recovers_from_initial_open_404(tmp_path, monkeypatc
 
         def open(self, stream=True):
             self.calls += 1
-            raise Exception(
-                'Not Found (404): {"error_code":"WSObjectNotFound","reason":"ObjectNotFoundException: Could not find document"}'
-            )
+            # Generic 404 (e.g. signed-URL expiry) — NOT WSObjectNotFound.
+            # WSObjectNotFound triggers the shared-file fast-fail path instead.
+            raise Exception("Not Found (404): signed URL expired")
 
     class _FreshItem:
         name = "test.txt"
