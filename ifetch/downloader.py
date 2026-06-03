@@ -263,6 +263,92 @@ class DownloadManager:
 
         raise Exception(f"Failed to download chunk {start}-{end} after {self.max_retries} retries: {last_error}")
 
+    def _try_shared_open(self, item: Any) -> Optional[Any]:
+        """Fallback download path for files shared from another user's iCloud account.
+
+        pyicloud's DriveNode.open() calls:
+            get_file(docwsid, zone=self.data["zone"])
+        which hits:
+            /ws/{zone}/download/by_id?document_id={docwsid}
+
+        For cross-user shared files Apple requires a 'shareID' parameter in that
+        request — the same credential that timlaing/pyicloud v2.5 threads through
+        retrieveItemDetailsInFolders to fix folder traversal (PR #152).  That PR
+        does NOT update get_file(), so the download endpoint still 404s.
+
+        Strategy 1 (most likely to work): include shareID in the download/by_id
+        request, constructing it manually via the drive session.
+
+        Strategy 2: try drivewsid as document_id (different ID space).
+
+        Strategy 3: re-fetch node metadata with shareID; Apple may return a direct
+        download URL in 'downloadURL'/'url'/'contentURL' fields.
+        """
+        data = getattr(item, 'data', None) or {}
+        docwsid = data.get('docwsid')
+        drivewsid = data.get('drivewsid')
+        zone = data.get('zone', 'com.apple.CloudDocs')
+        share_id = data.get('shareID')
+
+        if not self.api or not hasattr(self.api, 'drive'):
+            return None
+
+        drive = self.api.drive
+
+        # Strategy 1: replay the download/by_id request with shareID in params.
+        # This is the missing piece in pyicloud v2.5 — get_file() never sends it.
+        if (share_id and docwsid
+                and hasattr(drive, 'params')
+                and hasattr(drive, '_document_root')
+                and hasattr(drive, 'session')):
+            try:
+                file_params: Dict[str, Any] = dict(drive.params)
+                file_params.update({"document_id": docwsid, "shareID": share_id})
+                resp = drive.session.get(
+                    drive._document_root + f"/ws/{zone}/download/by_id",
+                    params=file_params,
+                )
+                if resp.ok:
+                    resp_json = resp.json()
+                    data_token = resp_json.get("data_token")
+                    package_token = resp_json.get("package_token")
+                    if data_token and data_token.get("url"):
+                        return drive.session.get(
+                            data_token["url"], params=drive.params, stream=True
+                        )
+                    if package_token and package_token.get("url"):
+                        return drive.session.get(
+                            package_token["url"], params=drive.params, stream=True
+                        )
+            except Exception:
+                pass
+
+        # Strategy 2: try drivewsid as document_id
+        if drivewsid and drivewsid != docwsid and hasattr(drive, 'get_file'):
+            try:
+                return drive.get_file(drivewsid, zone=zone, stream=True)
+            except Exception:
+                pass
+
+        # Strategy 3: refresh node metadata (passing shareID if available);
+        # Apple may embed a direct download URL in the response.
+        if drivewsid and hasattr(drive, 'get_node_data'):
+            try:
+                import inspect
+                gnd_sig = inspect.signature(drive.get_node_data)
+                if share_id and 'share_id' in gnd_sig.parameters:
+                    fresh = drive.get_node_data(drivewsid, share_id)
+                else:
+                    fresh = drive.get_node_data(drivewsid)
+                for key in ('downloadURL', 'url', 'contentURL'):
+                    url = fresh.get(key)
+                    if url:
+                        return self.http.get(url, stream=True, timeout=30)
+            except Exception:
+                pass
+
+        return None
+
     def _open_with_retry(
         self,
         item: Any,
@@ -281,13 +367,36 @@ class DownloadManager:
             except Exception as e:
                 last_error = e
                 error_str = str(e).lower()
-                not_found = (
-                    "404" in error_str or
-                    "not found" in error_str or
+                # Apple's "document not found in zone" — the docwsid belongs to
+                # another user's iCloud account (shared-with-me file).  Refreshing
+                # the item reference doesn't change the docwsid, so the usual
+                # get_drive_item retry loop is useless here.
+                is_apple_object_not_found = (
                     "wsobjectnotfound" in error_str or
                     "objectnotfoundexception" in error_str
                 )
-                if not_found and remote_path and attempt < max_retries - 1:
+                # Generic 404 (signed URL expired, pyicloud cache stale, etc.)
+                is_generic_404 = (
+                    "404" in error_str or "not found" in error_str
+                ) and not is_apple_object_not_found
+
+                if is_apple_object_not_found:
+                    fallback = self._try_shared_open(current_item)
+                    if fallback is not None:
+                        return fallback
+                    self.logger.warning(json.dumps({
+                        "event": "shared_file_download_attempted",
+                        "file": getattr(item, 'name', 'unknown'),
+                        "hint": (
+                            "File not found via standard download endpoint. "
+                            "This usually means the file was shared from another "
+                            "iCloud account. Alternate download strategies also "
+                            "failed. The file will be skipped."
+                        ),
+                    }))
+                    raise
+
+                if is_generic_404 and remote_path and attempt < max_retries - 1:
                     try:
                         current_item = self.get_drive_item(remote_path)
                         self.logger.warning(json.dumps({
@@ -310,7 +419,6 @@ class DownloadManager:
                     # Check if server specified retryAfter
                     wait_time = 2 ** (attempt + 1)  # Default: 2, 4, 8 seconds
                     if 'retryafter' in error_str:
-                        # Try to extract retryAfter value, cap at 60s
                         import re
                         match = re.search(r'retryafter["\s:]+(\d+)', error_str)
                         if match:
@@ -456,12 +564,23 @@ class DownloadManager:
                 return True
 
         except Exception as e:
-            self.logger.error(json.dumps({
+            error_str = str(e)
+            is_shared_file_error = any(x in error_str.lower() for x in [
+                'wsobjectnotfound', 'objectnotfoundexception',
+            ])
+            log_payload: Dict[str, Any] = {
                 "event": "download_failed",
                 "file": getattr(item, 'name', 'unknown'),
-                "error": str(e),
-                "traceback": traceback.format_exc()
-            }))
+                "error": error_str,
+                "traceback": traceback.format_exc(),
+            }
+            if is_shared_file_error:
+                log_payload["hint"] = (
+                    "This file appears to be shared from another iCloud account. "
+                    "Downloading files shared by other users is not currently supported "
+                    "by the underlying iCloud API. Only files you own can be downloaded."
+                )
+            self.logger.error(json.dumps(log_payload))
             if temp_path and temp_path.exists():
                 self.logger.warning(json.dumps({
                     "event": "temp_file_retained",
