@@ -84,6 +84,18 @@ def main():
         help='Custom path to a profile JSON file (overrides default ~/.ifetch_profiles.json)'
     )
 
+    parser.add_argument(
+        '--retry-failed',
+        dest='retry_failed',
+        nargs='?',
+        const='',
+        default=None,
+        help='Retry ONLY the files marked "failed" in a prior report, skipping the '
+             'full-tree walk and re-verification of good files. Optionally give a '
+             'report path (default: <local_path>/download_report.json). Requires the '
+             'same icloud_path (remote root) and local_path as the original run.'
+    )
+
     args = parser.parse_args()
 
     try:
@@ -122,7 +134,25 @@ def main():
         print("Authentication successful!")
 
         # Perform the requested operation
-        if args.list_shared:
+        if args.retry_failed is not None:
+            if not args.icloud_path:
+                raise ValueError("icloud_path (remote root) is required with --retry-failed")
+            from pathlib import Path as _P
+            report = args.retry_failed or str(_P(args.local_path) / "download_report.json")
+            print(f"\nRetrying failed entries from '{report}'")
+            downloader.retry_failed(
+                report,
+                args.icloud_path,
+                args.local_path,
+                log_file=args.log_file,
+            )
+            summary = downloader.generate_summary_report()["summary"]
+            print("\nRetry Summary:")
+            print(f"- Files retried: {summary['total_files']}")
+            print(f"- Successfully downloaded: {summary['successful']}")
+            print(f"- Still failed: {summary['failed']}")
+            print(f"- Total data transferred: {summary['total_bytes_transferred'] / (1024*1024):.2f} MB")
+        elif args.list_shared:
             print("\nListing top-level shared items:")
             print("-" * 50)
             downloader.list_shared_roots()

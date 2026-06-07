@@ -616,27 +616,29 @@ class DownloadManager:
         # Notify plugins about before/after failures handled above
 
     def _submit(self, item: Any, local_path: Path, remote_path: Optional[str] = None) -> None:
-        """Enqueue one item onto the shared traversal pool.
+        """Enqueue one tree item for processing on the shared pool."""
+        self._submit_task(self.process_item_parallel, item, local_path, remote_path)
+
+    def _submit_task(self, fn: Any, *args: Any) -> None:
+        """Run fn(*args) on the shared pool with traversal-completion counting.
 
         Counting is done on the future's done-callback (not inside the worker),
-        so it stays correct even if process_item_parallel is replaced/mocked.
-        The counter is incremented *before* submit; a directory worker submits
-        all of its children (each incrementing) before its own future completes,
-        so the counter never hits zero until the whole tree is drained.
+        so it stays correct even if the worker is replaced/mocked. The counter
+        is incremented *before* submit; a directory worker submits all of its
+        children (each incrementing) before its own future completes, so the
+        counter never hits zero until the whole tree is drained.
 
-        If there is no active pool (e.g. process_item_parallel called directly
-        outside download(), as in unit tests), the item is processed inline.
+        If there is no active pool (e.g. called directly outside download(),
+        as in unit tests), fn runs inline.
         """
         if self._executor is None:
-            self.process_item_parallel(item, local_path, remote_path)
+            fn(*args)
             return
 
         with self._pending_lock:
             self._pending += 1
         try:
-            future = self._executor.submit(
-                self.process_item_parallel, item, local_path, remote_path
-            )
+            future = self._executor.submit(fn, *args)
         except RuntimeError:
             # Executor already shutting down; undo the increment.
             self._on_item_done()
@@ -867,6 +869,108 @@ class DownloadManager:
         report_path = local_path_obj / "download_report.json"
         with report_path.open('w') as f:
             json.dump(report, f, indent=2)
+
+    def retry_failed(
+        self,
+        report_path: Union[str, Path],
+        icloud_path: str,
+        local_path: Union[str, Path] = '.',
+        log_file: Optional[str] = None,
+    ) -> None:
+        """Re-download only the entries marked 'failed' in a prior report.
+
+        Skips the full-tree walk and the re-verification of every already-
+        downloaded file. Reads ``report_path``, maps each failed local path
+        back to its iCloud remote path (``icloud_path`` is the remote root that
+        ``local_path`` mirrors), and downloads just those. Writes a fresh
+        ``retry_<report>.json`` next to the original so a second pass can target
+        any still-failing files.
+        """
+        if log_file:
+            self.logger = setup_logging(log_file)
+        if not self.api:
+            self.authenticate()
+        if not self.api or not self.api.drive:
+            raise Exception("iCloud Drive service not available")
+
+        report_path = Path(report_path)
+        if not report_path.exists():
+            raise FileNotFoundError(f"Report not found: {report_path}")
+        try:
+            data = json.loads(report_path.read_text())
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid report JSON {report_path}: {e}") from e
+
+        local_root = Path(local_path).resolve()
+        self.root_path = local_root
+        self.version_manager = VersionManager(local_root)
+        remote_root = icloud_path.strip("/")
+
+        failed = [d for d in data.get("details", []) if d.get("status") == "failed"]
+        targets = []
+        for d in failed:
+            # Resolve so a symlinked/normalised local_root still matches the
+            # absolute paths stored in the report (e.g. /tmp -> /private/tmp).
+            p = Path(d.get("path", "")).resolve()
+            try:
+                rel = p.relative_to(local_root)
+            except ValueError:
+                self.logger.error(json.dumps({
+                    "event": "retry_path_outside_root",
+                    "path": str(p), "local_root": str(local_root)
+                }))
+                continue
+            remote = f"{remote_root}/{rel.as_posix()}" if remote_root else rel.as_posix()
+            targets.append((remote, p))
+
+        self.logger.info(json.dumps({
+            "event": "retry_started",
+            "report": str(report_path),
+            "failed_in_report": len(failed),
+            "retrying": len(targets),
+        }))
+        print(f"Retrying {len(targets)} failed file(s) from {report_path.name} ...")
+        if not targets:
+            print("Nothing to retry.")
+            return
+
+        # Submission guard (start at 1, release after the loop) so the counter
+        # cannot momentarily hit zero between independent submissions.
+        self._pending = 1
+        self._traversal_done = threading.Event()
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            self._executor = executor
+            for remote, p in targets:
+                self._submit_task(self._retry_one, remote, p)
+            self._on_item_done()  # release guard
+            self._traversal_done.wait()
+        self._executor = None
+
+        if self.version_manager:
+            self.version_manager._save()
+
+        report = self.generate_summary_report()
+        out_path = report_path.with_name(f"retry_{report_path.name}")
+        with out_path.open("w") as f:
+            json.dump(report, f, indent=2)
+        self.logger.info(json.dumps({"event": "retry_completed", "summary": report["summary"]}))
+        print(f"Retry report saved to {out_path}")
+
+    def _retry_one(self, remote_path: str, local_path: Path) -> None:
+        """Resolve a single remote path then download it (used by retry_failed)."""
+        try:
+            item = self.get_drive_item(remote_path)
+        except Exception as e:
+            self.logger.error(json.dumps({
+                "event": "retry_resolve_failed",
+                "remote_path": remote_path, "error": str(e)
+            }))
+            self.download_results.append(DownloadStatus(
+                path=str(local_path), size=0, downloaded=0,
+                checksum="", status="failed", error=str(e)
+            ))
+            return
+        self.process_item_parallel(item, local_path, remote_path=remote_path)
 
     def _should_process(self, rel_path: Path, is_dir: bool) -> bool:
         """Return True if path should be downloaded/traversed based on include/exclude patterns."""
