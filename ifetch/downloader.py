@@ -649,11 +649,20 @@ class DownloadManager:
                         "before_download", remote_item=item, local_path=local_path
                     )
                     if self.download_drive_item(item, local_path, remote_path=remote_path):
-                        self.logger.info(json.dumps({
-                            "event": "download_success",
-                            "file": getattr(item, 'name', 'unknown'),
-                            "path": str(local_path)
-                        }))
+                        # download_drive_item returns True for both completed and
+                        # skipped files; check the recorded status to avoid
+                        # logging "download_success" for a file that was skipped.
+                        last_status = next(
+                            (r.status for r in reversed(self.download_results)
+                             if r.path == str(local_path)),
+                            "completed",
+                        )
+                        if last_status != "skipped":
+                            self.logger.info(json.dumps({
+                                "event": "download_success",
+                                "file": getattr(item, 'name', 'unknown'),
+                                "path": str(local_path)
+                            }))
                     else:
                         self.logger.error(json.dumps({
                             "event": "download_failed",

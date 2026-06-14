@@ -38,6 +38,23 @@ def test_process_item_parallel_skips_duplicate_active_download(monkeypatch, tmp_
     assert called == []
 
 
+def test_process_item_parallel_does_not_log_success_for_skipped_file(monkeypatch, tmp_path):
+    dm = DownloadManager(email="user@example.com", skip_existing=True)
+    dm.root_path = tmp_path
+    events = []
+    item = _File()
+    local_path = tmp_path / "file.txt"
+    local_path.write_bytes(b"existing")  # file already on disk
+
+    monkeypatch.setattr(dm.logger, "info", lambda payload: events.append(json.loads(payload)))
+
+    dm.process_item_parallel(item, local_path, remote_path="Documents/file.txt")
+
+    event_names = [e["event"] for e in events]
+    assert "file_skipped" in event_names
+    assert "download_success" not in event_names
+
+
 def test_process_item_parallel_logs_failed_download(monkeypatch, tmp_path):
     dm = DownloadManager(email="user@example.com")
     events = []
