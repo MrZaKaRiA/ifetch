@@ -152,6 +152,25 @@ def test_generate_summary_report_counts_results():
     assert report["summary"]["total_changed_chunks"] == 2
 
 
+def test_download_expands_home_directory_in_local_path(monkeypatch, tmp_path):
+    dm = DownloadManager(email="user@example.com")
+
+    # Redirect the home directory so "~" expands under tmp_path on any platform.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    monkeypatch.setattr(dm, "authenticate", lambda: setattr(dm, "api", type("API", (), {"drive": object()})()))
+    monkeypatch.setattr(dm, "get_drive_item", lambda path: "item")
+    monkeypatch.setattr(dm, "process_item_parallel", lambda item, local_path, remote_path=None: None)
+    monkeypatch.setattr(dm.plugin_manager, "dispatch", lambda *args, **kwargs: None)
+
+    dm.download("Documents", "~/LocalBackup")
+
+    # Report must land under the expanded home dir, not a literal "~" folder.
+    assert (tmp_path / "LocalBackup" / "download_report.json").exists()
+    assert not (Path("~") / "LocalBackup").exists()
+
+
 def test_download_writes_report_and_dispatches_completion(monkeypatch, tmp_path):
     dm = DownloadManager(email="user@example.com")
     dispatched = []
