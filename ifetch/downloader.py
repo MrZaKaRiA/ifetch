@@ -47,11 +47,24 @@ class DownloadManager:
         self.download_results: List[DownloadStatus] = []
         self._active_downloads: Set[str] = set()
         self._download_lock = threading.Lock()
+        # Single, globally-bounded traversal pool (created in download()).
+        # Concurrency is capped at max_workers for BOTH directory listing and
+        # file downloads, instead of spawning a fresh pool per directory (which
+        # multiplied concurrency with tree depth and triggered iCloud throttling
+        # + connection churn). Workers submit children to this same pool and
+        # never block waiting on them, so there is no pool-starvation deadlock.
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._pending = 0
+        self._pending_lock = threading.Lock()
+        self._traversal_done = threading.Event()
         self.chunker = FileChunker(chunk_size)
         self.http = requests.Session()
         adapter = HTTPAdapter(
             pool_connections=max(1, max_workers),
-            pool_maxsize=max(1, max_workers * 2),
+            pool_maxsize=max(1, max_workers),
+            pool_block=True,  # wait for a free pooled connection rather than
+                              # opening+discarding extras (prevents the TCP/TLS
+                              # connection churn that piled up CLOSE_WAITs)
         )
         self.http.mount("http://", adapter)
         self.http.mount("https://", adapter)
@@ -552,7 +565,9 @@ class DownloadManager:
                                 "archived_path": str(local_path),
                                 "timestamp": time.strftime("%Y%m%dT%H%M%S"),
                             }]
-                    self.version_manager._save()
+                    # NOTE: do NOT _save() here. Rewriting the whole metadata file
+                    # after every file is O(n^2) and serializes all download threads
+                    # on the version lock. The metadata is flushed once in download().
 
                 # Notify plugins about successful download
                 self.plugin_manager.dispatch(
@@ -600,13 +615,55 @@ class DownloadManager:
 
         # Notify plugins about before/after failures handled above
 
+    def _submit(self, item: Any, local_path: Path, remote_path: Optional[str] = None) -> None:
+        """Enqueue one item onto the shared traversal pool.
+
+        Counting is done on the future's done-callback (not inside the worker),
+        so it stays correct even if process_item_parallel is replaced/mocked.
+        The counter is incremented *before* submit; a directory worker submits
+        all of its children (each incrementing) before its own future completes,
+        so the counter never hits zero until the whole tree is drained.
+
+        If there is no active pool (e.g. process_item_parallel called directly
+        outside download(), as in unit tests), the item is processed inline.
+        """
+        if self._executor is None:
+            self.process_item_parallel(item, local_path, remote_path)
+            return
+
+        with self._pending_lock:
+            self._pending += 1
+        try:
+            future = self._executor.submit(
+                self.process_item_parallel, item, local_path, remote_path
+            )
+        except RuntimeError:
+            # Executor already shutting down; undo the increment.
+            self._on_item_done()
+            return
+        future.add_done_callback(self._on_item_done)
+
+    def _on_item_done(self, _future: Any = None) -> None:
+        """Mark one submitted item as finished; signal when the tree is drained."""
+        with self._pending_lock:
+            self._pending -= 1
+            if self._pending == 0:
+                self._traversal_done.set()
+
     def process_item_parallel(
         self,
         item: Any,
         local_path: Path,
         remote_path: Optional[str] = None,
     ) -> None:
-        """Process files and directories in parallel."""
+        """Process exactly ONE item (file or directory).
+
+        Files are downloaded inline (this worker occupies one of the pool's
+        max_workers slots). Directories list their children and submit each
+        child back onto the *same* shared pool via _submit, then return - they
+        never block waiting on their children, so total live concurrency stays
+        capped at max_workers regardless of tree depth.
+        """
         try:
             # If file/dir is excluded by patterns, skip
             rel_path = local_path.relative_to(self.root_path) if self.root_path else local_path
@@ -639,44 +696,27 @@ class DownloadManager:
                         }))
                 finally:
                     with self._download_lock:
-                        self._active_downloads.remove(local_path_str)
+                        self._active_downloads.discard(local_path_str)
 
             elif hasattr(item, 'dir'):
                 contents = item.dir()
                 if contents:
-                    # Pre-resolve all child items BEFORE parallel execution to avoid
-                    # "dictionary changed size during iteration" when pyicloud lazily
-                    # loads items and modifies its internal cache
+                    # Snapshot child names first (pyicloud mutates its internal
+                    # cache as items are lazily resolved), then submit each child
+                    # to the shared pool.
                     content_names = list(contents.keys()) if hasattr(contents, 'keys') else list(contents)
-                    child_items = []
+                    local_path.mkdir(parents=True, exist_ok=True)
                     for name in content_names:
                         child_remote_path = name if not remote_path else f"{remote_path.rstrip('/')}/{name}"
-                        child_items.append((item[name], local_path / name, child_remote_path))
-                    local_path.mkdir(parents=True, exist_ok=True)
-                    with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                        futures = [
-                            executor.submit(self.process_item_parallel, child_item, child_path, child_remote_path)
-                            for child_item, child_path, child_remote_path in child_items
-                        ]
-                        for future in as_completed(futures):
-                            # Retrieve result or exception
-                            try:
-                                future.result()
-                            except Exception as e:
-                                self.logger.error(json.dumps({
-                                    "event": "future_exception",
-                                    "error": str(e),
-                                    "traceback": traceback.format_exc()
-                                }))
+                        self._submit(item[name], local_path / name, child_remote_path)
 
-                        # after_download hook success/failure already inside download_drive_item,
-                        # but make sure to send event even if function returned False
-                        self.plugin_manager.dispatch(
-                            "after_download",
-                            remote_item=item,
-                            local_path=local_path,
-                            success=False,
-                        )
+                    # after_download hook (directory-level event, parity with prior behaviour)
+                    self.plugin_manager.dispatch(
+                        "after_download",
+                        remote_item=item,
+                        local_path=local_path,
+                        success=False,
+                    )
 
         except Exception as e:
             self.logger.error(json.dumps({
@@ -799,7 +839,23 @@ class DownloadManager:
         }))
 
         remote_path = icloud_path.strip("/") or None
-        self.process_item_parallel(item, local_path_obj, remote_path=remote_path)
+
+        # Single shared pool for the whole traversal. The root item is submitted
+        # onto it; directory workers submit their children onto the same pool.
+        # We wait on _traversal_done (set when the last outstanding item drains)
+        # rather than blocking pool workers on each other.
+        self._pending = 0
+        self._traversal_done = threading.Event()
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            self._executor = executor
+            self._submit(item, local_path_obj, remote_path=remote_path)
+            self._traversal_done.wait()
+        self._executor = None
+
+        # Flush version metadata once, after the whole traversal, instead of
+        # rewriting it per-file (which was O(n^2) and the main slowdown cause).
+        if self.version_manager:
+            self.version_manager._save()
 
         report = self.generate_summary_report()
         self.logger.info(json.dumps({"event": "download_completed", "summary": report}))
