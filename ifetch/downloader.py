@@ -33,6 +33,7 @@ class DownloadManager:
         chunk_size: int = 1024 * 1024,
         include_patterns: Optional[List[str]] = None,
         exclude_patterns: Optional[List[str]] = None,
+        skip_existing: bool = False,
     ):
         self.email = email or os.environ.get('ICLOUD_EMAIL')
         if not self.email:
@@ -71,6 +72,10 @@ class DownloadManager:
 
         self.include_patterns = include_patterns or []
         self.exclude_patterns = exclude_patterns or []
+
+        # When True, any file that already exists on disk is left untouched
+        # instead of being differentially updated or overwritten.
+        self.skip_existing = skip_existing
 
         # Load plugins once during instantiation
         self.plugin_manager = PluginManager()
@@ -462,6 +467,24 @@ class DownloadManager:
             }))
             return False
 
+        # Skip-existing mode: if the file is already on disk, leave it exactly
+        # as-is. We return before opening the remote item so no network request
+        # is made and the local copy can never be overwritten.
+        if self.skip_existing and local_path.exists():
+            self.logger.info(json.dumps({
+                "event": "file_skipped",
+                "file": item.name,
+                "path": str(local_path),
+                "reason": "already exists on disk (skip-existing enabled)"
+            }))
+            self.download_results.append(DownloadStatus(
+                path=str(local_path),
+                size=local_path.stat().st_size,
+                downloaded=0,
+                status="skipped"
+            ))
+            return True
+
         tracker = DownloadTracker(local_path)
         temp_path: Optional[Path] = None
         total_size = 0
@@ -685,11 +708,20 @@ class DownloadManager:
                         "before_download", remote_item=item, local_path=local_path
                     )
                     if self.download_drive_item(item, local_path, remote_path=remote_path):
-                        self.logger.info(json.dumps({
-                            "event": "download_success",
-                            "file": getattr(item, 'name', 'unknown'),
-                            "path": str(local_path)
-                        }))
+                        # download_drive_item returns True for both completed and
+                        # skipped files; check the recorded status to avoid
+                        # logging "download_success" for a file that was skipped.
+                        last_status = next(
+                            (r.status for r in reversed(self.download_results)
+                             if r.path == str(local_path)),
+                            "completed",
+                        )
+                        if last_status != "skipped":
+                            self.logger.info(json.dumps({
+                                "event": "download_success",
+                                "file": getattr(item, 'name', 'unknown'),
+                                "path": str(local_path)
+                            }))
                     else:
                         self.logger.error(json.dumps({
                             "event": "download_failed",
@@ -792,6 +824,7 @@ class DownloadManager:
         total_files = len(self.download_results)
         successful = sum(1 for r in self.download_results if r.status == "completed")
         failed = sum(1 for r in self.download_results if r.status == "failed")
+        skipped = sum(1 for r in self.download_results if r.status == "skipped")
         total_bytes = sum(r.downloaded for r in self.download_results)
         total_changes = sum(getattr(r, 'changes', 0) for r in self.download_results)
 
@@ -800,6 +833,7 @@ class DownloadManager:
                 "total_files": total_files,
                 "successful": successful,
                 "failed": failed,
+                "skipped": skipped,
                 "total_bytes_transferred": total_bytes,
                 "total_changed_chunks": total_changes,
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
@@ -823,8 +857,10 @@ class DownloadManager:
         if not self.api or not self.api.drive:
             raise Exception("iCloud Drive service not available")
 
-        # Convert local_path to Path if it's a string
-        local_path_obj = Path(local_path).resolve()
+        # Convert local_path to Path if it's a string. expanduser() makes a
+        # leading "~" resolve to the user's home directory even when the shell
+        # (e.g. PowerShell) passes it through literally.
+        local_path_obj = Path(local_path).expanduser().resolve()
 
         # Initialise version manager for this download session
         self.root_path = local_path_obj

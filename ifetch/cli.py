@@ -67,6 +67,13 @@ def main():
     )
 
     parser.add_argument(
+        '--skip-existing',
+        dest='skip_existing',
+        action='store_true',
+        help='Skip files that already exist locally instead of updating/overwriting them'
+    )
+
+    parser.add_argument(
         '--list-shared',
         dest='list_shared',
         action='store_true',
@@ -106,6 +113,8 @@ def main():
             print(f"Remote Path: {args.icloud_path}")
         print(f"Local Path: {args.local_path}")
         print(f"Parallel Workers: {args.max_workers}")
+        if args.skip_existing:
+            print("Skip-existing: ON (files already on disk will be left untouched)")
         print("=" * 70)
 
         # Load profile patterns
@@ -125,7 +134,8 @@ def main():
             max_retries=args.max_retries,
             chunk_size=args.chunk_size,
             include_patterns=include_pats,
-            exclude_patterns=exclude_pats
+            exclude_patterns=exclude_pats,
+            skip_existing=args.skip_existing
         )
 
         # Authenticate (will prompt for password if needed)
@@ -176,6 +186,7 @@ def main():
             print("\nDownload Summary:")
             print(f"- Total files: {summary['total_files']}")
             print(f"- Successfully downloaded: {summary['successful']}")
+            print(f"- Skipped (already on disk): {summary['skipped']}")
             print(f"- Failed: {summary['failed']}")
             print(f"- Total data transferred: {summary['total_bytes_transferred'] / (1024*1024):.2f} MB")
             print(f"- Changed chunks: {summary['total_changed_chunks']}")
